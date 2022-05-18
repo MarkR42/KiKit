@@ -1608,7 +1608,47 @@ class Panel:
                         (x[0] + c * vthickness // 2, x[1])])
                     cuts.append(cut)
         self.appendSubstrate(pieces)
+        # TODO: Make this optional.
+        # If we do not have horizontal and vertical backbone,
+        # Remove cuts not at the edge of the panel
+        # As it will probably be possible to remove the boards without these
+        # outer cuts (just snap on the other axis)
+        if not ((hthickness > 0) and (vthickness > 0)):
+            cuts = self._removeMiddleCuts(cuts)
         return cuts
+        
+    def _removeMiddleCuts(self, cuts):
+        """
+            Remove any cuts in the list cuts (LineString) which
+            are not in the centre of the panel, i.e. on
+            the boundaries.
+        """
+        if len(cuts) == 0:
+            return cuts
+        # Determine the bounds
+        all_x = [c.coords[0][0] for c in cuts] + [c.coords[1][0] for c in cuts]
+        all_y = [c.coords[0][1] for c in cuts] + [c.coords[1][1] for c in cuts]
+        minx = min(all_x)
+        miny = min(all_y)
+        maxx = max(all_x)
+        maxy = max(all_y)
+        print("_removeMiddleCuts: " + repr( [minx, miny, maxx, maxy] ))
+        print("_removeMiddleCuts: original {}".format(len(cuts)) )
+        outer_cuts = []
+        for c in cuts:
+            # Check if line is completely on the edge.
+            is_outer = [ # All coords must lie on perimeter.
+                (
+                    coord[0] in (minx, maxx)
+                    or
+                    coord[1] in (miny, maxy)
+                )
+                for coord in c.coords]
+            if all(is_outer):
+                # Edge piece.
+                outer_cuts.append(c)
+        print("_removeMiddleCuts: remaining {}".format(len(outer_cuts)) )
+        return outer_cuts
 
     def addCornerFillets(self, radius):
         corners = self.panelCorners()
