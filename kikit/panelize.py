@@ -1,3 +1,4 @@
+import itertools
 from pcbnewTransition import pcbnew, isV6
 from kikit import sexpr
 from kikit.common import normalize
@@ -33,28 +34,59 @@ class PanelError(RuntimeError):
 def identity(x):
     return x
 
-class BasicGridPosition:
+class GridPlacerBase:
+    def position(self, i: int, j: int, boardSize: Optional[wxRect]) -> wxPoint:
+        """
+        Given row and col coords of a board, return physical physical position
+        of the board. All function calls (except for 0, 0) also receive board
+        size.
+
+        The position of the board is relative to the top-left board, coordinates
+        (0, 0) should yield placement (0, 0).
+        """
+        raise NotImplementedError("GridPlacerBase.position has to be overridden")
+
+    def rotation(self, i: int, j: int) -> int:
+        """
+        Given row and col coords of a board, return the orientation of the board
+        """
+        return 0
+
+class BasicGridPosition(GridPlacerBase):
     """
-    Specify board position in the grid. This class
+    Specify board position in the grid.
     """
-    def __init__(self, destination, boardSize, horSpace, verSpace):
-        self.destination = destination
-        self.boardSize = boardSize
+    def __init__(self, horSpace: int, verSpace: int,
+                 hbonewidth: int=0, vbonewidth: int=0,
+                 hboneskip: int=0, vboneskip: int=0) -> None:
         self.horSpace = horSpace
         self.verSpace = verSpace
+        self.hbonewidth = hbonewidth
+        self.vbonewidth = vbonewidth
+        self.hboneskip = hboneskip
+        self.vboneskip = vboneskip
 
-    def position(self, i, j):
-        return wxPoint(self.destination[0] + j * (self.boardSize.GetWidth() + self.horSpace),
-                       self.destination[1] + i * (self.boardSize.GetHeight() + self.verSpace))
+    def position(self, i: int, j: int, boardSize: Optional[wxRect]) -> wxPoint:
+        if boardSize is None:
+            assert i == 0 and j == 0
+            return wxPoint(0, 0)
+        hbonecount = 0 if self.hbonewidth == 0 \
+                       else i // (self.hboneskip + 1)
+        vbonecount = 0 if self.vbonewidth == 0 \
+                       else j // (self.vboneskip + 1)
+        return wxPoint(j * (boardSize.GetWidth() + self.horSpace) + \
+                            vbonecount * (self.vbonewidth + self.horSpace),
+                       i * (boardSize.GetHeight() + self.verSpace) + \
+                            hbonecount * (self.hbonewidth + self.verSpace))
 
-    def rotation(self, i, j):
+    def rotation(self, i: int, j: int) -> int:
         return 0
 
 class OddEvenRowsPosition(BasicGridPosition):
     """
     Rotate boards by 180° for every row
     """
-    def rotation(self, i, j):
+    def rotation(self, i: int, j: int) -> int:
         if i % 2 == 0:
             return 0
         return 1800
@@ -63,7 +95,7 @@ class OddEvenColumnPosition(BasicGridPosition):
     """
     Rotate boards by 180° for every column
     """
-    def rotation(self, i, j):
+    def rotation(self, i: int, j: int) -> int:
         if j % 2 == 0:
             return 0
         return 1800
@@ -72,7 +104,7 @@ class OddEvenRowsColumnsPosition(BasicGridPosition):
     """
     Rotate boards by 180 for every row and column
     """
-    def rotation(self, i, j):
+    def rotation(self, i: int, j: int) -> int:
         if (i % 2) == (j % 2):
             return 0
         return 1800
@@ -177,7 +209,7 @@ def roundPoint(point, precision=-4):
         return Point(round(point.x, precision), round(point.y, precision))
     return Point(round(point[0], precision), round(point[1], precision))
 
-def doTransformation(point: KiKitPoint, rotation: int, origin: KiKitPoint, translation: KiKitPoint) -> wxPoint:
+def doTransformation(point: KiKitPoint, rotation: KiAngle, origin: KiKitPoint, translation: KiKitPoint) -> wxPoint:
     """
     Abuses KiCAD to perform a tranformation of a point
     """
@@ -338,6 +370,17 @@ def maxTabCount(edgeLen, width, minDistance):
         return 0
     c = 1 + (edgeLen - minDistance) // (minDistance + width)
     return max(0, int(c))
+
+def skipBackbones(backbones: List[LineString], skip: int,
+                  key: Callable[[LineString], int]) -> List[LineString]:
+    """
+    Given a list of backbones, get only every (skip + 1) other one. Treats
+    all backbones on a given coordinate as one.
+    """
+    candidates = list(set(map(key, backbones)))
+    candidates.sort()
+    active = set(itertools.islice(candidates, skip, None, skip + 1))
+    return [x for x in backbones if key(x) in active]
 
 class Panel:
     """
@@ -840,20 +883,74 @@ class Panel:
             segments.append((label, None))
         return segments
 
-    def _placeBoardsInGrid(self, boardfile, rows, cols, destination, sourceArea, tolerance,
-                  verSpace, horSpace, rotation, netRenamer, refRenamer,
-                  placementClass):
+    def makeGrid(self, boardfile: str, sourceArea: wxRect, rows: int, cols: int,
+                 destination: wxPoint, placer: GridPlacerBase,
+                 rotation: KiAngle=0, netRenamePattern: str="Board_{n}-{orig}",
+                 refRenamePattern: str="Board_{n}-{orig}", tolerance: KiLength=0) \
+                     -> List[Substrate]:
         """
-        Create a grid of boards, return source board size aligned at the top
-        left corner
+        Place the given board in a grid pattern with given spacing. The board
+        position of the gride is guided via placer. The nets and references are
+        renamed according to the patterns.
+
+        Parameters:
+
+        boardfile - the path to the filename of the board to be added
+
+        sourceArea - the region within the file specified to be selected (see
+        also tolerance, below)
+            set to None to automatically calculate the board area from the board
+            file with the given tolerance
+
+        rows - the number of boards to place in the vertical direction
+
+        cols - the number of boards to place in the horizontal direction
+
+        destination - the center coordinates of the first board in the grid (for
+        example, wxPointMM(100,50))
+
+        rotation - the rotation angle to be applied to the source board before
+        placing it
+
+        placer - the placement rules for boards. The builtin classes are:
+            BasicGridPosition - places each board in its original orientation
+            OddEvenColumnPosition - every second column has the boards rotated
+            by 180 degrees OddEvenRowPosition - every second row has the boards
+            rotated by 180 degrees OddEvenRowsColumnsPosition - every second row
+            and column has the boards rotated by 180 degrees
+
+        netRenamePattern - the pattern according to which the net names are
+        transformed
+            The default pattern is "Board_{n}-{orig}" which gives each board its
+            own instance of its nets, i.e. GND becomes Board_0-GND for the first
+            board , and Board_1-GND for the second board etc
+
+        refRenamePattern - the pattern according to which the reference
+        designators are transformed
+            The default pattern is "Board_{n}-{orig}" which gives each board its
+            own instance of its reference designators, so R1 becomes Board_0-R1
+            for the first board, Board_1-R1 for the second board etc. To keep
+            references the same as in the original, set this to "{orig}"
+
+        tolerance - if no sourceArea is specified, the distance by which the
+        selection
+            area for the board should extend outside the board edge. If you have
+            any objects that are on or outside the board edge, make sure this is
+            big enough to include them. Such objects often include zone outlines
+            and connectors.
+
+        Returns a list of the placed substrates. You can use these to generate
+        tabs, frames, backbones, etc.
         """
-        boardSize = wxRect(0, 0, 0, 0)
+        substrateCount = len(self.substrates)
+        netRenamer = lambda x, y: netRenamePattern.format(n=x, orig=y)
+        refRenamer = lambda x, y: refRenamePattern.format(n=x, orig=y)
+
+        boardSize = None
         topLeftSize = None
-        placement = placementClass(destination, boardSize, horSpace, verSpace)
         for i, j in product(range(rows), range(cols)):
-            placement.boardSize = boardSize
-            dest = placement.position(i, j)
-            boardRotation = rotation + placement.rotation(i, j)
+            dest = destination + placer.position(i, j, topLeftSize)
+            boardRotation = rotation + placer.rotation(i, j)
             boardSize = self.appendBoard(
                 boardfile, dest, sourceArea=sourceArea,
                 tolerance=tolerance, origin=Origin.Center,
@@ -861,68 +958,7 @@ class Panel:
                 refRenamer=refRenamer)
             if not topLeftSize:
                 topLeftSize = boardSize
-        return topLeftSize
 
-    def makeGrid(self, boardfile, sourceArea, rows, cols, destination,
-                    verSpace, horSpace, rotation,
-                    placementClass=BasicGridPosition,
-                    netRenamePattern="Board_{n}-{orig}",
-                    refRenamePattern="Board_{n}-{orig}", tolerance=0):
-        """
-        Place the given board in a regular grid pattern with given spacing
-        (verSpace, horSpace). The board position can be fine-tuned via
-        placementClass. The nets and references are renamed according to the
-        patterns.
-
-        Parameters:
-
-        boardfile - the path to the filename of the board to be added
-
-        sourceArea - the region within the file specified to be selected (see also tolerance, below)
-            set to None to automatically calculate the board area from the board file with the given tolerance
-
-        rows - the number of boards to place in the vertical direction
-
-        cols - the number of boards to place in the horizontal direction
-
-        destination - the center coordinates of the first board in the grid (for example, wxPointMM(100,50))
-
-        verSpace - the vertical spacing (distance, not pitch) between boards
-
-        horSpace - the horizontal spacing (distance, not pitch) between boards
-
-        rotation - the rotation angle to be applied to the source board before placing it
-
-        placementClass - the placement rules for boards. The builtin classes are:
-            BasicGridPosition - places each board in its original orientation
-            OddEvenColumnPosition - every second column has the boards rotated by 180 degrees
-            OddEvenRowPosition - every second row has the boards rotated by 180 degrees
-            OddEvenRowsColumnsPosition - every second row and column has the boards rotated by 180 degrees
-
-        netRenamePattern - the pattern according to which the net names are transformed
-            The default pattern is "Board_{n}-{orig}" which gives each board its own instance of its nets,
-            i.e. GND becomes Board_0-GND for the first board , and Board_1-GND for the second board etc
-
-        refRenamePattern - the pattern according to which the reference designators are transformed
-            The default pattern is "Board_{n}-{orig}" which gives each board its own instance of its reference designators,
-            so R1 becomes Board_0-R1 for the first board, Board_1-R1 for the recond board etc. To keep references the
-            same as in the original, set this to "{orig}"
-
-        tolerance - if no sourceArea is specified, the distance by which the selection
-            area for the board should extend outside the board edge.
-            If you have any objects that are on or outside the board edge, make sure this is big enough to include them.
-            Such objects often include zone outlines and connectors.
-
-        Returns a list of the placed substrates. You can use these to generate
-        tabs, frames, backbones, etc.
-        """
-
-        substrateCount = len(self.substrates)
-        netRenamer = lambda x, y: netRenamePattern.format(n=x, orig=y)
-        refRenamer = lambda x, y: refRenamePattern.format(n=x, orig=y)
-        self._placeBoardsInGrid(boardfile, rows, cols, destination,
-                                sourceArea, tolerance, verSpace, horSpace,
-                                rotation, netRenamer, refRenamer, placementClass)
         return self.substrates[substrateCount:]
 
     def makeFrame(self, width, hspace, vspace):
@@ -1340,12 +1376,16 @@ class Panel:
         self.copperLayerCount = count
         self.board.SetCopperLayerCount(self.copperLayerCount)
 
-    def copperFillNonBoardAreas(self, layers=[Layer.F_Cu,Layer.B_Cu]):
+    def copperFillNonBoardAreas(self, clearance: KiLength=fromMm(1),
+            layers: List[Layer]=[Layer.F_Cu,Layer.B_Cu], hatched: bool=False,
+            strokeWidth: KiLength=fromMm(1), strokeSpacing: KiLength=fromMm(1),
+            orientation: KiAngle=fromDegrees(45)) -> None:
         """
         Fill given layers with copper on unused areas of the panel
-        (frame, rails and tabs)
+        (frame, rails and tabs). You can specify the clearance, if it should be
+        hatched (default is solid) or shape the strokes of hatched pattern.
 
-        takes a list of layer ids (Default [kikit.defs.Layer.F_Cu, kikit.defs.Layer.B_Cu])
+        By default, fills top and bottom layer.
         """
         if not self.boardSubstrate.isSinglePiece():
             raise RuntimeError("The substrate has to be a single piece to fill unused areas")
@@ -1354,11 +1394,23 @@ class Panel:
         increaseZonePriorities(self.board)
 
         zoneContainer = pcbnew.ZONE(self.board)
-        boundary = self.boardSubstrate.exterior().boundary
-        zoneContainer.Outline().AddOutline(linestringToKicad(boundary))
+        if hatched:
+            zoneContainer.SetFillMode(pcbnew.ZONE_FILL_MODE_HATCH_PATTERN)
+            zoneContainer.SetHatchOrientation(orientation // 10)
+            zoneContainer.SetHatchGap(strokeSpacing)
+            zoneContainer.SetHatchThickness(strokeWidth)
+
+        zoneArea = self.boardSubstrate.exterior()
         for substrate in self.substrates:
-            boundary = substrate.exterior().boundary
-            zoneContainer.Outline().AddHole(linestringToKicad(boundary))
+            zoneArea = zoneArea.difference(substrate.exterior().buffer(clearance))
+
+        geoms = [zoneArea] if isinstance(zoneArea, Polygon) else zoneArea.geoms
+
+        for g in geoms:
+            zoneContainer.Outline().AddOutline(linestringToKicad(g.exterior))
+        for g in geoms:
+            for hole in g.interiors:
+                zoneContainer.Outline().AddHole(linestringToKicad(hole))
         zoneContainer.SetPriority(0)
 
         zoneContainer.SetLayer(layers[0])
@@ -1545,68 +1597,88 @@ class Panel:
         lines = [box(*s.bounds()).exterior for s in self.substrates]
         self._renderLines(lines, Layer.Cmts_User, fromMm(0.5))
 
-    def renderBackbone(self, vthickness, hthickness, vcut, hcut):
+    def renderBackbone(self, vthickness: KiLength, hthickness: KiLength,
+            vcut: bool, hcut: bool, vskip: int=0, hskip: int=0):
         """
         Render horizontal and vertical backbone lines. If zero thickness is
         specified, no backbone is rendered.
 
         vcut, hcut specifies if vertical or horizontal backbones should be cut.
 
+        vskip and hskip specify how many backbones should be skipped before
+        rendering one (i.e., skip 1 meand that every other backbone will be
+        rendered)
+
         Return a list of cuts
         """
+        hbones = [] if hthickness == 0 \
+                    else list(filter(lambda l: isHorizontal(l.coords[0], l.coords[1]), self.backboneLines))
+        activeHbones = skipBackbones(hbones, hskip, lambda x: x.coords[0][1])
+
+        vbones = [] if vthickness == 0 \
+                    else list(filter(lambda l: isVertical(l.coords[0], l.coords[1]), self.backboneLines))
+        activeVbones = skipBackbones(vbones, vskip, lambda x: x.coords[0][0])
+
+
         cutpoints = commonPoints(self.backboneLines)
         pieces, cuts = [], []
-        for l in self.backboneLines:
+
+        for l in activeHbones:
             start = l.coords[0]
             end = l.coords[1]
-            if isHorizontal(start, end) and hthickness > 0:
-                minX = min(start[0], end[0])
-                maxX = max(start[0], end[0])
-                bb = box(minX, start[1] - hthickness // 2,
-                         maxX, start[1] + hthickness // 2)
-                pieces.append(bb)
-                if not hcut:
-                    continue
 
-                candidates = []
+            minX = min(start[0], end[0])
+            maxX = max(start[0], end[0])
+            bb = box(minX, start[1] - hthickness // 2,
+                        maxX, start[1] + hthickness // 2)
+            pieces.append(bb)
+            if not hcut:
+                continue
 
-                if cutpoints[start] > 2:
-                    candidates.append(((start[0] + vthickness // 2, start[1]), -1))
+            candidates = []
 
-                if cutpoints[end] == 2:
-                    candidates.append((end, 1))
-                elif cutpoints[end] > 2:
-                    candidates.append(((end[0] - vthickness // 2, end[1]), 1))
+            if cutpoints[start] > 2:
+                candidates.append(((start[0] + vthickness // 2, start[1]), -1))
 
-                for x, c in candidates:
-                    cut = LineString([
-                        (x[0], x[1] - c * hthickness // 2),
-                        (x[0], x[1] + c * hthickness // 2)])
-                    cuts.append(cut)
-            if isVertical(start, end) and vthickness > 0:
-                minY = min(start[1], end[1])
-                maxY = max(start[1], end[1])
-                bb = box(start[0] - vthickness // 2, minY,
-                         start[0] + vthickness // 2, maxY)
-                pieces.append(bb)
-                if not vcut:
-                    continue
+            if cutpoints[end] == 2:
+                candidates.append((end, 1))
+            elif cutpoints[end] > 2:
+                candidates.append(((end[0] - vthickness // 2, end[1]), 1))
 
-                candidates = []
+            for x, c in candidates:
+                cut = LineString([
+                    (x[0], x[1] - c * hthickness // 2),
+                    (x[0], x[1] + c * hthickness // 2)])
+                cuts.append(cut)
 
-                if cutpoints[start] > 2:
-                    candidates.append(((start[0], start[1] + hthickness // 2), 1))
+        for l in activeVbones:
+            start = l.coords[0]
+            end = l.coords[1]
 
-                if cutpoints[end] == 2:
-                    candidates.append((end, -1))
-                elif cutpoints[end] > 2:
-                    candidates.append(((end[0], end[1] - hthickness // 2), -1))
+            minY = min(start[1], end[1])
+            maxY = max(start[1], end[1])
+            bb = box(start[0] - vthickness // 2, minY,
+                        start[0] + vthickness // 2, maxY)
+            pieces.append(bb)
+            if not vcut:
+                continue
 
-                for x, c in candidates:
-                    cut = LineString([
-                        (x[0] - c * vthickness // 2, x[1]),
-                        (x[0] + c * vthickness // 2, x[1])])
-                    cuts.append(cut)
+            candidates = []
+
+            if cutpoints[start] > 2:
+                candidates.append(((start[0], start[1] + hthickness // 2), 1))
+
+            if cutpoints[end] == 2:
+                candidates.append((end, -1))
+            elif cutpoints[end] > 2:
+                candidates.append(((end[0], end[1] - hthickness // 2), -1))
+
+            for x, c in candidates:
+                cut = LineString([
+                    (x[0] - c * vthickness // 2, x[1]),
+                    (x[0] + c * vthickness // 2, x[1])])
+                cuts.append(cut)
+
         self.appendSubstrate(pieces)
         # TODO: Make this optional.
         # If we do not have horizontal and vertical backbone,

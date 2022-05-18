@@ -90,6 +90,7 @@ def postProcessPreset(preset):
         "tooling": ppTooling,
         "fiducials": ppFiducials,
         "text": ppText,
+        "copperfill": ppCopper,
         "post": ppPost,
         "page": ppPage,
         "debug": ppDebug
@@ -145,7 +146,7 @@ def validateSections(preset):
     validate all required keys are present. Ignores excessive keys.
     """
     VALID_SECTIONS = ["layout", "source", "tabs", "cuts", "framing", "tooling",
-        "fiducials", "text", "page", "post", "debug"]
+        "fiducials", "text", "page", "copperfill", "post", "debug"]
     extraSections = set(preset.keys()).difference(VALID_SECTIONS)
     if len(extraSections) != 0:
         raise PresetError(f"Extra sections {', '.join(extraSections)} in preset")
@@ -233,12 +234,17 @@ def buildLayout(layout, panel, sourceBoard, sourceArea, framing):
         type = layout["type"]
         if type == "grid":
             placementClass = getPlacementClass(layout["alternation"])
+            placer = placementClass(
+                verSpace=layout["vspace"],
+                horSpace=layout["hspace"],
+                hbonewidth=layout["hbackbone"],
+                vbonewidth=layout["vbackbone"],
+                hboneskip=layout["hboneskip"],
+                vboneskip=layout["vboneskip"])
             substrates = panel.makeGrid(
                 boardfile=sourceBoard, sourceArea=sourceArea,
-                rows=layout["rows"], cols=layout["cols"], destination=wxPointMM(50, 50),
-                rotation=layout["rotation"],
-                verSpace=layout["vspace"], horSpace=layout["hspace"],
-                placementClass=placementClass,
+                rows=layout["rows"], cols=layout["cols"], destination=wxPointMM(0, 0),
+                rotation=layout["rotation"], placer=placer,
                 netRenamePattern=layout["renamenet"], refRenamePattern=layout["renameref"])
             framingSubstrates = dummyFramingSubstrate(substrates, framing)
             panel.buildPartitionLineFromBB(framingSubstrates)
@@ -298,7 +304,8 @@ def buildBackBone(layout, panel, substrates, frameSpace):
     """
     try:
         return panel.renderBackbone(layout["vbackbone"], layout["hbackbone"],
-                                    layout["vbonecut"], layout["hbonecut"])
+                                    layout["vbonecut"], layout["hbonecut"],
+                                    layout["vboneskip"], layout["hboneskip"])
     except KeyError as e:
         raise PresetError(f"Missing parameter '{e}' in section 'layout'")
 
@@ -534,6 +541,32 @@ def buildText(preset, panel):
         raise PresetError(f"Unknown type '{type}' of text specification.")
     except KeyError as e:
         raise PresetError(f"Missing parameter '{e}' in section 'text'")
+
+def buildCopperfill(preset, panel):
+    """
+    Perform copperfill operation
+    """
+    try:
+        type = preset["type"]
+        if type == "none":
+            return
+        if type == "solid":
+            panel.copperFillNonBoardAreas(
+                clearance=preset["clearance"],
+                layers=preset["layers"],
+                hatched=False
+            )
+        if type == "hatched":
+            panel.copperFillNonBoardAreas(
+                    clearance=preset["clearance"],
+                    layers=preset["layers"],
+                    hatched=True,
+                    strokeWidth=preset["width"],
+                    strokeSpacing=preset["spacing"],
+                    orientation=preset["orientation"]
+            )
+    except KeyError as e:
+        raise PresetError(f"Missing parameter '{e}' in section 'postprocessing'")
 
 def buildPostprocessing(preset, panel):
     """

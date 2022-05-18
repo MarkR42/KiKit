@@ -11,6 +11,8 @@
         "renameref": "{orig}",
         "hbackbone": "0mm",
         "vbackbone": "0mm",
+        "hboneskip": 0,
+        "vboneskip": 0,
         "vbonecut": true,
         "hbonecut": true,
         "code": "none",
@@ -96,6 +98,14 @@
         "thickness": "0.3mm",
         "layer": "F.SilkS",
         "plugin": "none"
+    },
+    "copperfill": {
+        "type": "none",
+        "clearance": "0.5mm",
+        "layers": "F.Cu,B.Cu",
+        "width": "1mm",
+        "spacing": "1mm",
+        "orientation": "45deg"
     },
     "post": {
         "type": "auto",
