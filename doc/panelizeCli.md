@@ -69,9 +69,7 @@ To give and example, consider the two following configurations:
         "width": "3mm"
     },
     "framing": {
-        "type": "frame",
-        "frameWidth": "100mm",
-        "frameHeight": "100mm"
+        "type": "frame"
     }
 }
 
@@ -94,9 +92,7 @@ When we merge `B` into `A`, we get:
     },
     "framing": {
         "type": "rails"
-        "width": "5mm",
-        "frameWidth": "100mm",
-        "frameHeight": "100mm"
+        "width": "5mm"
     }
 }
 ```
@@ -364,6 +360,9 @@ left/right rails.
 - `width` - specify with of the rails or frame
 - `fillet`, `chamfer` - fillet/chamfer frame corners. Specify radius or chamfer
   size.
+- `mintotalheight`, `mintotalwidth` – if needed, add extra material to the rail
+  or frame to meet the minimal requested size. Useful for services that require
+  minimal panel size.
 
 #### Railstb/Railslr
 
@@ -436,9 +435,13 @@ Fiducials based on a plugin.
 
 Add text to the panel. Allows you to put a single block of text on panel. You
 can use variables enclosed in `{}`. E.g. `{boardTitle} | {boardDate}`. The list
-of all available variables in listed bellow.  If you
-need more text or more sophisticated placing options, see `script` option from
-`postprocess`.
+of all available variables in listed bellow. In the case you need more
+independent texts on the panel, you can use sections names `text2`, `text3` and
+`text3` to add at most 4 text. All these sections behave the same and accept the
+same options.
+
+If you need more texts or more sophisticated placing options, see `script`
+option from `postprocess`.
 
 **Types**: none, simple
 
@@ -478,7 +481,7 @@ the `plugin` field.
 
 Sets page size on the resulting panel and position the panel in the page. The
 type of style dictates paper size. The default `inherit` option inherits paper
-size from the source board.
+size from the source board. This feature is not supported on KiCAD 5
 
 **Types**: `inherit`, `custom`, `A0`, `A1`, `A2`, `A3`, `A4`, `A5`, `A`, `B`,
 `C`, `D`, `E`, `USLetter`, `USLegal`, `USLedger`, `A0-portrait`, `A1-portrait`,
@@ -508,7 +511,8 @@ Fill non-board areas of the panel with copper.
 
 - `clearance` - optional extra clearance from the board perimeters. Suitable
   for, e.g., not filling the tabs with copper.
-- `layers` - comma-separated list of layer to fill. Default top and bottom.
+- `layers` - comma-separated list of layer to fill. Default top and bottom. You
+  can specify a shortcut `all` to fill all layers.
 
 ### Solid
 
@@ -539,6 +543,8 @@ Finishing touches to the panel.
 - `reconstructarcs` - the panelization process works on top of a polygonal
   representation of the board. This options allows to reconstruct the arcs in
   the design before saving the panel.
+- `refillzones` – refill the user zones after the panel is build. This is only
+  necessary when you want your zones to avoid cuts in panel.
 - `script` - a path to custom Python file. The file should contain a function
   `kikitPostprocess(panel, args)` that receives the prepared panel as the
   `kikit.panelize.Panel` object and the user-supplied arguments as a string -

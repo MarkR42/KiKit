@@ -15,7 +15,9 @@ from kikit.drc_ui import ReportLevel
 ItemFingerprint = Tuple[int, int, str]
 
 def roundCoord(x: int) -> int:
-    return round(x, -3)
+    # KiCAD doesn't round the values, it just cuts the decimal places. So let's
+    # emulate that
+    return round(x - 50, -4)
 
 def getItemFingerprint(item: pcbnew.BOARD_ITEM):
     return (roundCoord(item.GetPosition()[0]), # Round down, since the output does the same
@@ -38,6 +40,7 @@ def collectFingerprints(board: pcbnew.BOARD) -> Dict[ItemFingerprint, pcbnew.BOA
         collect(f.Pads())
         collect(f.GraphicalItems())
         collect(f.Zones())
+        collect([f.Reference(), f.Value()])
     collect(board.GetTracks())
     collect(board.Zones())
 
@@ -116,7 +119,7 @@ def readBoardItem(text: str,
     """
     Given DRC report object description, try to find it in the board
     """
-    itemMatch = re.match(r'\s*@\((\d*(.\d*)?) mm, (\d*(.\d*)?) mm\): (.*)$', text)
+    itemMatch = re.match(r'\s*@\((-?\d*(\.\d*)?) mm, (-?\d*(\.\d*)?) mm\): (.*)$', text)
     if itemMatch is None:
         raise RuntimeError(f"Cannot parse board item from '{text}'")
     posX = float(itemMatch.group(1))
@@ -126,8 +129,7 @@ def readBoardItem(text: str,
     try:
         return fingerprints[fPrint]
     except KeyError:
-        x = '\n'.join([f"{x}: {y}" for x, y in fingerprints.items()])
-        raise RuntimeError(f"Cannot find board item from '{text}', fingerprint: '{fPrint}'\n\n{x}") from None
+        raise RuntimeError(f"Cannot find board item from '{text}', fingerprint: '{fPrint}'") # from None
 
 def readViolations(reportFile: TextIO,
                    fingerprints: Dict[ItemFingerprint, pcbnew.BOARD_ITEM]) \

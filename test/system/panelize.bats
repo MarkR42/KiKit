@@ -215,6 +215,18 @@ load common
         $RES/conn.kicad_pcb panel.kicad_pcb
 }
 
+@test "Set page" {
+    if [ $(kikit-info drcapi) -lt 1 ]; then
+        skip "KiCAD $(kikit-info kicadversion) doesn't support page size."
+    fi
+
+    kikit panelize \
+        --page 'A3;' \
+        --debug 'trace: true; deterministic: true' \
+        $RES/conn.kicad_pcb panel.kicad_pcb
+}
+
+
 @test "Use layout plugin" {
     kikit panelize --dump preset.json \
         --layout "plugin; code: $RES/testplugin.py.MyLayout" \

@@ -1,9 +1,10 @@
+from copy import deepcopy
 import itertools
 from pcbnewTransition import pcbnew, isV6
 from kikit import sexpr
 from kikit.common import normalize
 
-from typing import Any, Callable, Dict, List, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Set, Tuple, Union
 
 from pcbnew import (GetBoard, LoadBoard,
                     FromMM, ToMM, wxPoint, wxRect, wxRectMM, wxPointMM)
@@ -117,6 +118,32 @@ class Origin(Enum):
     BottomLeft = 3
     BottomRight = 4
 
+
+class NetClass():
+    """
+    Internal representation of a netclass. Work-around for KiCAD 6.0.6 missing
+    support for netclasses in API
+    """
+    def __init__(self, settings: Any) -> None:
+        self.data = settings
+        self.nets: Set[str] = set()
+
+    @property
+    def name(self) -> str:
+        return self.data["name"]
+
+    @property
+    def originalNets(self) -> List[str]:
+        return self.data.get("nets", [])
+
+    def addNet(self, netname: str) -> None:
+        self.nets.add(netname)
+
+    def serialize(self) -> Any:
+        data = deepcopy(self.data)
+        data["nets"] = list(self.nets)
+        return data
+
 def getOriginCoord(origin, bBox):
     """Returns real coordinates (wxPoint) of the origin for given bounding box"""
     if origin == Origin.Center:
@@ -166,7 +193,8 @@ def remapNets(collection, mapping):
     for item in collection:
         item.SetNetCode(mapping[item.GetNetname()].GetNetCode())
 
-def toPolygon(entity):
+ToPolygonGeometry = Union[Polygon, wxRect, Substrate]
+def toPolygon(entity: Union[List[ToPolygonGeometry], ToPolygonGeometry]) -> Polygon:
     if isinstance(entity, list):
         return list([toPolygon(e) for e in entity])
     if isinstance(entity, Polygon) or isinstance(entity, MultiPolygon):
@@ -177,6 +205,8 @@ def toPolygon(entity):
             (entity.GetX() + entity.GetWidth(), entity.GetY()),
             (entity.GetX() + entity.GetWidth(), entity.GetY() + entity.GetHeight()),
             (entity.GetX(), entity.GetY() + entity.GetHeight())])
+    if isinstance(entity, Substrate):
+        return Substrate.substrates
     raise NotImplementedError("Cannot convert {} to Polygon".format(type(entity)))
 
 def rectString(rect):
@@ -184,7 +214,7 @@ def rectString(rect):
                 ToMM(rect.GetX()), ToMM(rect.GetY()),
                 ToMM(rect.GetWidth()), ToMM(rect.GetHeight()))
 
-def expandRect(rect, offsetX, offsetY=None):
+def expandRect(rect: wxRect, offsetX: KiLength, offsetY: Optional[KiLength]=None):
     """
     Given a wxRect returns a new rectangle, which is larger in all directions
     by offset. If only offsetX is passed, it used for both X and Y offset
@@ -245,7 +275,7 @@ def removeCutsFromFootprint(footprint):
     """
     edges = []
     for edge in footprint.GraphicalItems():
-        if edge.GetLayerName() != "Edge.Cuts":
+        if edge.GetLayer() != Layer.Edge_Cuts:
             continue
         edges.append(edge)
     for e in edges:
@@ -416,24 +446,45 @@ class Panel:
 
         self.annotationReader: AnnotationReader = AnnotationReader.getDefault()
         self.drcExclusions: List[DrcExclusion] = []
+        # At the moment (KiCAD 6.0.6) has broken support for net classes.
+        # Therefore we have to handle them separately
+        self.newNetClasses: Dict[str, Any] = {}
 
-    def save(self, reconstructArcs=False):
+    def save(self, reconstructArcs: bool=False, refillAllZones: bool=False):
         """
         Saves the panel to a file and makes the requested changes to the prl and
         pro files.
         """
-        newEdges = self.boardSubstrate.serialize(reconstructArcs)
-        for edge in newEdges:
-            self.board.Add(edge)
+        panelEdges = self.boardSubstrate.serialize(reconstructArcs)
+        boardsEdges = self._getRefillEdges(reconstructArcs)
+
         vcuts = self._renderVCutH() + self._renderVCutV()
         keepouts = []
         for cut, clearanceArea in vcuts:
             self.board.Add(cut)
             if clearanceArea is not None:
                 keepouts.append(self.addKeepout(clearanceArea))
-        fillerTool = pcbnew.ZONE_FILLER(self.board)
-        fillerTool.Fill(self.zonesToRefill)
+
+        # Rendering happens in two phases:
+        # - first, we render original board edges and save the board (to
+        #   propagate all the design rules from project files)
+        # - then we load the board, fill polygons and render panel edges.
+
+        for edge in boardsEdges:
+            self.board.Add(edge)
+
+        # We mark zone to refill via name prefix - this is the only way we can
+        # remember it between saves
+        originalZoneNames = {}
+        for i, zone in enumerate(self.zonesToRefill):
+            newName = f"KIKIT_zone_{i}"
+            originalZoneNames[newName] = zone.GetZoneName()
+            zone.SetZoneName(newName)
         self.board.Save(self.filename)
+        if isV6():
+            self.makeLayersVisible() # as they are not in KiCAD 6
+            self.transferProjectSettings()
+
         # Remove cuts
         for cut, _ in vcuts:
             self.board.Remove(cut)
@@ -441,13 +492,45 @@ class Panel:
         for keepout in keepouts:
             self.board.Remove(keepout)
         # Remove edges
-        for edge in newEdges:
+        for edge in panelEdges:
             self.board.Remove(edge)
 
-        if isV6():
-            self.makeLayersVisible() # as they are not in KiCAD 6
-            self.mergeDrcRules()
+        # Handle zone refilling in a separate board
+        fillBoard = pcbnew.LoadBoard(self.filename)
+        fillerTool = pcbnew.ZONE_FILLER(fillBoard)
+        if refillAllZones:
+            fillerTool.Fill(fillBoard.Zones())
+
+        for edge in collectEdges(fillBoard, Layer.Edge_Cuts):
+            fillBoard.Remove(edge)
+        for edge in panelEdges:
+            fillBoard.Add(edge)
+
+        zonesToRefill = pcbnew.ZONES()
+        for zone in fillBoard.Zones():
+            zName = zone.GetZoneName()
+            if zName.startswith("KIKIT_zone_"):
+                zonesToRefill.append(zone)
+                zone.SetZoneName(originalZoneNames[zName])
+        fillerTool.Fill(zonesToRefill)
+
+        fillBoard.Save(self.filename)
         self._adjustPageSize()
+
+    def _getRefillEdges(self, reconstructArcs: bool):
+        """
+        Builds a list of edges that represent boards outlines and panel
+        surrounding as independent pieces of substrate
+        """
+        boardsEdges = list(chain(*[sub.serialize(reconstructArcs) for sub in self.substrates]))
+
+        surrounding = self.boardSubstrate.substrates.difference(
+            shapely.ops.unary_union(list(
+                sub.substrates.buffer(fromMm(0.2)) for sub in self.substrates)))
+        surroundingSubstrate = Substrate([])
+        surroundingSubstrate.union(surrounding)
+        boardsEdges += surroundingSubstrate.serialize()
+        return boardsEdges
 
     def _uniquePrefix(self):
         return "Board_{}-".format(len(self.substrates))
@@ -484,11 +567,14 @@ class Panel:
             # The PRL file is not always created, ignore it
             pass
 
-    def mergeDrcRules(self):
+    def transferProjectSettings(self):
         """
         Examine DRC rules of the source boards, merge them into a single set of
         rules and store them in *.kicad_pro file. Also stores board DRC
         exclusions.
+
+        Also, transfers the list of net classes from the internal representation
+        into the project file.
         """
         assert isV6()
 
@@ -511,12 +597,44 @@ class Panel:
             currentPro["board"]["design_settings"] = sourcePro["board"]["design_settings"]
             currentPro["board"]["design_settings"]["drc_exclusions"] = [
                 serializeExclusion(e) for e in self.drcExclusions]
+            currentPro["text_variables"] = sourcePro.get("text_variables", {})
+
+            currentPro["net_settings"]["classes"] = sourcePro["net_settings"]["classes"]
+            currentPro["net_settings"]["classes"] += [x.serialize() for x in self.newNetClasses.values()]
             with open(self.getProFilepath(), "w") as f:
                 json.dump(currentPro, f, indent=2)
         except (KeyError, FileNotFoundError):
             # This means the source board has no DRC setting. Probably a board
             # without attached project
             pass
+
+    def _inheritNetClasses(self, board, netRenamer):
+        """
+        KiCAD 6.0.6 has broken API for net classes. Therefore, we have to load
+        and save the net classes manually in the project file
+        """
+        proFilename = os.path.splitext(board.GetFileName())[0]+'.kicad_pro'
+        try:
+            with open(proFilename) as f:
+                project = json.load(f)
+        except FileNotFoundError:
+            # If the source board doesn't contain project, there's nothing to
+            # inherit.
+            return
+        seenNets = set()
+        for c in project["net_settings"]["classes"]:
+            c["name"] = netRenamer(c["name"])
+            nc = NetClass(c)
+            for net in nc.originalNets:
+                seenNets.add(net)
+                nc.addNet(netRenamer(net))
+            self.newNetClasses[nc.name] = nc
+        defaultNetClass = self.newNetClasses[netRenamer("Default")]
+        for name in collectNetNames(board):
+            if name in seenNets:
+                continue
+            defaultNetClass.addNet(netRenamer(name))
+
 
     def _adjustPageSize(self) -> None:
         """
@@ -527,7 +645,7 @@ class Panel:
         if self.pageSize is None:
             return
         with open(self.filename, "r") as f:
-            tree = parseSexprF(f)
+            tree = parseSexprF(f, limit=10) # Introduce limit to speed up parsing
         # Find paper property
         paperExpr = None
         for subExpr in tree:
@@ -678,7 +796,13 @@ class Panel:
 
         if netRenamer is None:
             netRenamer = lambda x, y: self._uniquePrefix() + y
-        renameNets(board, lambda x: netRenamer(len(self.substrates), x))
+        bId = len(self.substrates)
+        netRenamerFn = lambda x: netRenamer(bId, x)
+
+        if isV6():
+            self._inheritNetClasses(board, netRenamerFn)
+
+        renameNets(board, netRenamerFn)
         if refRenamer is not None:
             renameRefs(board, lambda x: refRenamer(len(self.substrates), x))
 
@@ -766,7 +890,7 @@ class Panel:
                 pass # Ignore boards without a project
         return findBoundingBox(edges)
 
-    def appendSubstrate(self, substrate):
+    def appendSubstrate(self, substrate: ToPolygonGeometry) -> None:
         """
         Append a piece of substrate or a list of pieces to the panel. Substrate
         can be either wxRect or Shapely polygon. Newly appended corners can be
@@ -961,7 +1085,9 @@ class Panel:
 
         return self.substrates[substrateCount:]
 
-    def makeFrame(self, width, hspace, vspace):
+    def makeFrame(self, width: KiLength, hspace: KiLength, vspace: KiLength,
+                  minWidth: KiLength=0, minHeight: KiLength=0) \
+                     -> Tuple[Iterable[LineString], Iterable[LineString]]:
         """
         Build a frame around the boards. Specify width and spacing between the
         boards substrates and the frame. Return a tuple of vertical and
@@ -977,9 +1103,21 @@ class Panel:
 
         vspace - vertical space between board outline and substrate
 
+        minWidth - if the panel doesn't meet this width, it is extended
+
+        minHeight - if the panel doesn't meet this height, it is extended
+
         """
         frameInnerRect = expandRect(shpBoxToRect(self.boardsBBox()), hspace, vspace)
         frameOuterRect = expandRect(frameInnerRect, width)
+        if frameOuterRect.GetWidth() < minWidth:
+            diff = minWidth - frameOuterRect.GetWidth()
+            frameOuterRect.SetX(frameOuterRect.GetX() - diff // 2)
+            frameOuterRect.SetWidth(frameOuterRect.GetWidth() + diff)
+        if frameOuterRect.GetHeight() < minHeight:
+            diff = minHeight - frameOuterRect.GetHeight()
+            frameOuterRect.SetY(frameOuterRect.GetY() - diff // 2)
+            frameOuterRect.SetHeight(frameOuterRect.GetHeight() + diff)
         outerRing = rectToRing(frameOuterRect)
         innerRing = rectToRing(frameInnerRect)
         polygon = Polygon(outerRing, [innerRing])
@@ -992,7 +1130,9 @@ class Panel:
         frameCutsH = self.makeFrameCutsH(innerArea, frameInnerRect, frameOuterRect)
         return frameCutsV, frameCutsH
 
-    def makeTightFrame(self, width, slotwidth, hspace, vspace):
+    def makeTightFrame(self, width: KiLength, slotwidth: KiLength,
+                      hspace: KiLength, vspace: KiLength,  minWidth: KiLength=0,
+                      minHeight: KiLength=0) -> None:
         """
         Build a full frame with board perimeter milled out.
         Add your boards to the panel first using appendBoard or makeGrid.
@@ -1007,8 +1147,12 @@ class Panel:
 
         vspace - vertical space between board outline and substrate
 
+        minWidth - if the panel doesn't meet this width, it is extended
+
+        minHeight - if the panel doesn't meet this height, it is extended
+
         """
-        self.makeFrame(width, hspace, vspace)
+        self.makeFrame(width, hspace, vspace, minWidth, minHeight)
         boardSlot = GeometryCollection()
         for s in self.substrates:
             boardSlot = boardSlot.union(s.exterior())
@@ -1016,21 +1160,27 @@ class Panel:
         frameBody = box(*self.boardSubstrate.bounds()).difference(boardSlot)
         self.appendSubstrate(frameBody)
 
-    def makeRailsTb(self, thickness):
+    def makeRailsTb(self, thickness: KiLength, minHeight: KiLength=0):
         """
-        Adds a rail to top and bottom.
+        Adds a rail to top and bottom. You can specify minimal height the panel
+        has to feature.
         """
         minx, miny, maxx, maxy = self.panelBBox()
+        if maxy - miny + 2 * thickness < minHeight:
+            thickness = (minHeight - maxy + miny) // 2
         topRail = box(minx, maxy, maxx, maxy + thickness)
         bottomRail = box(minx, miny, maxx, miny - thickness)
         self.appendSubstrate(topRail)
         self.appendSubstrate(bottomRail)
 
-    def makeRailsLr(self, thickness):
+    def makeRailsLr(self, thickness: KiLength, minWidth: KiLength=0):
         """
-        Adds a rail to left and right.
+        Adds a rail to left and right. You can specify minimal width the panel
+        has to feature.
         """
         minx, miny, maxx, maxy = self.panelBBox()
+        if maxx - minx + 2 * thickness < minWidth:
+            thickness = (minWidth - maxx + minx) // 2
         leftRail = box(minx - thickness, miny, minx, maxy)
         rightRail = box(maxx, miny, maxx + thickness, maxy)
         self.appendSubstrate(leftRail)
@@ -1381,24 +1531,18 @@ class Panel:
             strokeWidth: KiLength=fromMm(1), strokeSpacing: KiLength=fromMm(1),
             orientation: KiAngle=fromDegrees(45)) -> None:
         """
-        Fill given layers with copper on unused areas of the panel
-        (frame, rails and tabs). You can specify the clearance, if it should be
-        hatched (default is solid) or shape the strokes of hatched pattern.
+        Fill given layers with copper on unused areas of the panel (frame, rails
+        and tabs). You can specify the clearance, if it should be hatched
+        (default is solid) or shape the strokes of hatched pattern.
 
-        By default, fills top and bottom layer.
+        By default, fills top and bottom layer, but you can specify any other
+        copper layer that is enabled.
         """
         if not self.boardSubstrate.isSinglePiece():
             raise RuntimeError("The substrate has to be a single piece to fill unused areas")
         if not len(layers)>0:
             raise RuntimeError("No layers to add copper to")
         increaseZonePriorities(self.board)
-
-        zoneContainer = pcbnew.ZONE(self.board)
-        if hatched:
-            zoneContainer.SetFillMode(pcbnew.ZONE_FILL_MODE_HATCH_PATTERN)
-            zoneContainer.SetHatchOrientation(orientation // 10)
-            zoneContainer.SetHatchGap(strokeSpacing)
-            zoneContainer.SetHatchThickness(strokeWidth)
 
         zoneArea = self.boardSubstrate.exterior()
         for substrate in self.substrates:
@@ -1407,20 +1551,24 @@ class Panel:
         geoms = [zoneArea] if isinstance(zoneArea, Polygon) else zoneArea.geoms
 
         for g in geoms:
+            zoneContainer = pcbnew.ZONE(self.board)
+            if hatched:
+                zoneContainer.SetFillMode(pcbnew.ZONE_FILL_MODE_HATCH_PATTERN)
+                zoneContainer.SetHatchOrientation(orientation // 10)
+                zoneContainer.SetHatchGap(strokeSpacing)
+                zoneContainer.SetHatchThickness(strokeWidth)
             zoneContainer.Outline().AddOutline(linestringToKicad(g.exterior))
-        for g in geoms:
             for hole in g.interiors:
                 zoneContainer.Outline().AddHole(linestringToKicad(hole))
-        zoneContainer.SetPriority(0)
+            zoneContainer.SetPriority(0)
 
-        zoneContainer.SetLayer(layers[0])
-        self.board.Add(zoneContainer)
-        self.zonesToRefill.append(zoneContainer)
-        for l in layers[1:]:
-            zoneContainer = zoneContainer.Duplicate()
-            zoneContainer.SetLayer(l)
-            self.board.Add(zoneContainer)
-            self.zonesToRefill.append(zoneContainer)
+            for l in layers:
+                if not self.board.GetEnabledLayers().Contains(l):
+                    continue
+                zoneContainer = zoneContainer.Duplicate()
+                zoneContainer.SetLayer(l)
+                self.board.Add(zoneContainer)
+                self.zonesToRefill.append(zoneContainer)
 
     def locateBoard(inputFilename, expandDist=None):
         """
@@ -1738,9 +1886,9 @@ class Panel:
             self.boardSubstrate.cut(cutShape)
 
     def addCornerChamfers(self, size):
-        corners = self.panelCorners()
-        verticalStops = self.panelCorners(0, size)
-        horizontalStops = self.panelCorners(size, 0)
+        corners = self.panelCorners(-SHP_EPSILON, -SHP_EPSILON)
+        verticalStops = self.panelCorners(-SHP_EPSILON, size)
+        horizontalStops = self.panelCorners(size, -SHP_EPSILON)
         for t, v, h in zip(corners, verticalStops, horizontalStops):
             cutPoly = Polygon([t, v, h, t])
             self.boardSubstrate.cut(cutPoly)
@@ -1792,7 +1940,7 @@ def extractSourceAreaByAnnotation(board, reference):
     """
     annotation = getFootprintByReference(board, reference)
     tip = annotation.GetPosition()
-    edges = collectEdges(board, "Edge.Cuts")
+    edges = collectEdges(board, Layer.Edge_Cuts)
     # KiCAD 6 will need an adjustment - method Collide was introduced with
     # different parameters. But v6 API is not available yet, so we leave this
     # to future ourselves.
